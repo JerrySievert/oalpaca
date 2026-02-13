@@ -77,7 +77,7 @@ export function load_config(config_path) {
 /**
  * Detect model type from model name or path
  * @param {string} model - Model name or path
- * @returns {'qwen3' | 'llama3'} Detected model type
+ * @returns {'qwen3' | 'llama3' | 'granite'} Detected model type
  */
 export function detect_model_type(model) {
   const lower = model.toLowerCase();
@@ -88,6 +88,10 @@ export function detect_model_type(model) {
 
   if (lower.includes('llama')) {
     return 'llama3';
+  }
+
+  if (lower.includes('granite')) {
+    return 'granite';
   }
 
   // Default to qwen3 as it has broader compatibility

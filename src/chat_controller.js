@@ -87,6 +87,15 @@ export class ChatController {
         response = await this.session.prompt(current_input);
       }
 
+      // Debug: log raw model output
+      console.log('\n[DEBUG] Raw model output:');
+      console.log('---START---');
+      console.log(response);
+      console.log('---END---');
+      console.log(
+        `[DEBUG] has_tool_calls: ${this.handler.has_tool_calls(response)}`
+      );
+
       // Check for tool calls
       if (this.handler.has_tool_calls(response)) {
         const tool_calls = this.handler.parse_tool_calls(response);
@@ -106,13 +115,18 @@ export class ChatController {
         // Execute tool calls
         const results = [];
         for (const call of tool_calls) {
+          console.log(`\n[Calling tool: ${call.name}]`);
+          console.log(`[Arguments: ${JSON.stringify(call.arguments)}]`);
+
           try {
             const result = await this.mcp_manager.call_tool(
               call.name,
               call.arguments
             );
+            console.log(`[Tool result received]`);
             results.push({ name: call.name, result, success: true });
           } catch (error) {
+            console.error(`[Tool error: ${error.message}]`);
             results.push({
               name: call.name,
               result: error.message,

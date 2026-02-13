@@ -5,10 +5,12 @@
 
 import qwen3_handler from './qwen3.js';
 import llama3_handler from './llama3.js';
+import granite_handler from './granite.js';
 
 const handlers = {
   qwen3: qwen3_handler,
-  llama3: llama3_handler
+  llama3: llama3_handler,
+  granite: granite_handler
 };
 
 /**
@@ -20,10 +22,12 @@ export function get_handler(model_type) {
   const handler = handlers[model_type];
 
   if (!handler) {
-    throw new Error(`Unknown model type: ${model_type}. Supported types: ${Object.keys(handlers).join(', ')}`);
+    throw new Error(
+      `Unknown model type: ${model_type}. Supported types: ${Object.keys(handlers).join(', ')}`
+    );
   }
 
   return handler;
 }
 
-export { qwen3_handler, llama3_handler };
+export { qwen3_handler, llama3_handler, granite_handler };
