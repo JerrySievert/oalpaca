@@ -49,7 +49,12 @@ export class ChatController {
     const tools = this.mcp_manager.get_all_tools();
     const tools_prompt = this.handler.format_tools_for_prompt(tools);
 
-    const full_system_prompt = this.system_prompt + tools_prompt;
+    // Append current date and time so the model has a concept of time
+    const now = new Date();
+    const date_time_str = `\n\nCurrent date and time: ${now.toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' })}`;
+
+    const full_system_prompt =
+      this.system_prompt + date_time_str + tools_prompt;
 
     this.session = new LlamaChatSession({
       contextSequence: this.context.getSequence(),

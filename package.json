@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node src/index.js",
     "server": "node src/server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "tokens": "node src/token_cli.js",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
   },
   "keywords": [
     "llama",
@@ -15,11 +17,15 @@
     "tool-use",
     "ai"
   ],
-  "author": "",
+  "author": "Jerry Sievert <code@legitimatesounding.com>",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3",
     "node-llama-cpp": "^3.15.1",
     "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.0.18",
+    "vitest": "^4.0.18"
   }
 }
