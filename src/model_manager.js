@@ -341,11 +341,13 @@ export class ModelManager {
 
   /**
    * Get model info objects for all configured models (for /api/tags)
+   * @param {string[]|null} [allowed_models] - If provided, filter to only these model names
    * @returns {Array}
    */
-  get_all_model_info() {
+  get_all_model_info(allowed_models) {
     const results = [];
     for (const [name, model_config] of Object.entries(this.config.models)) {
+      if (allowed_models && !allowed_models.includes(name)) continue;
       const insights = this.gguf_insights.get(name);
       const model_type = detect_model_type(name, model_config.model_type);
       results.push({
@@ -369,11 +371,13 @@ export class ModelManager {
 
   /**
    * Get model info for currently loaded (running) models (for /api/ps)
+   * @param {string[]|null} [allowed_models] - If provided, filter to only these model names
    * @returns {Array}
    */
-  get_running_model_info() {
+  get_running_model_info(allowed_models) {
     const results = [];
     for (const entry of this.loaded_models.values()) {
+      if (allowed_models && !allowed_models.includes(entry.name)) continue;
       const insights = this.gguf_insights.get(entry.name);
       results.push({
         name: entry.name,

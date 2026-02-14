@@ -44,6 +44,19 @@ function create_spinner(prefix) {
 }
 
 async function main() {
+  // Subcommand routing: delegate to token CLI or server if requested
+  const sub = process.argv[2];
+  if (sub === 'tokens') {
+    process.argv.splice(2, 1); // remove 'tokens' so token_cli sees correct args
+    await import('./token_cli.js');
+    return;
+  }
+  if (sub === 'server') {
+    process.argv.splice(2, 1);
+    await import('./server.js');
+    return;
+  }
+
   const config_path = process.argv[2] || DEFAULT_CONFIG_PATH;
 
   console.log('='.repeat(50));
@@ -61,26 +74,35 @@ async function main() {
     process.exit(1);
   }
 
-  // Detect model type
-  const model_type = detect_model_type(config.model);
-  console.log(`Detected model type: ${model_type}`);
+  // Select model from multi-model config
+  const model_names = Object.keys(config.models);
+  if (model_names.length === 0) {
+    console.error('No models configured.');
+    process.exit(1);
+  }
+
+  const selected_name = process.argv[3] || model_names[0];
+  const model_config = config.models[selected_name];
+  if (!model_config) {
+    console.error(
+      `Model "${selected_name}" not found. Available: ${model_names.join(', ')}`
+    );
+    process.exit(1);
+  }
+
+  const model_type = detect_model_type(selected_name, model_config.model_type);
+  console.log(`Model: ${selected_name} (${model_type})`);
 
   // Initialize MCP clients
   const mcp_manager = new McpClientManager();
 
-  if (config.mcp_servers.length > 0) {
+  if (model_config.mcp_servers.length > 0) {
     console.log('\nConnecting to MCP servers...');
-    await mcp_manager.connect_all(config.mcp_servers);
+    await mcp_manager.connect_all(model_config.mcp_servers);
   }
 
   // Initialize llama.cpp
   console.log('\nLoading model...');
-
-  if (!config.model_path) {
-    console.error('Error: model_path is required in configuration');
-    await mcp_manager.disconnect_all();
-    process.exit(1);
-  }
 
   let llama, model, context, chat_controller;
 
@@ -88,14 +110,14 @@ async function main() {
     llama = await getLlama();
 
     model = await llama.loadModel({
-      modelPath: config.model_path
+      modelPath: model_config.model_path
     });
 
     context = await model.createContext({
-      contextSize: config.context_size
+      contextSize: model_config.context_size
     });
 
-    console.log(`Model loaded: ${config.model}`);
+    console.log(`Model loaded: ${selected_name}`);
 
     // Initialize chat controller
     chat_controller = new ChatController({
@@ -104,7 +126,7 @@ async function main() {
       context,
       model_type,
       mcp_manager,
-      system_prompt: config.system_prompt || ''
+      system_prompt: model_config.system_prompt || ''
     });
 
     await chat_controller.initialize();
@@ -192,7 +214,7 @@ async function main() {
         return;
       }
 
-      const spinner = create_spinner(`${config.assistant_name}:`);
+      const spinner = create_spinner(`${model_config.assistant_name}:`);
       try {
         spinner.start();
         const response = await chat_controller.chat(trimmed);
