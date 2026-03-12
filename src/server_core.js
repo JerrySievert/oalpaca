@@ -14,6 +14,24 @@ const DEFAULT_PORT = 9000;
 const DEFAULT_HOST = '0.0.0.0';
 const MAX_TOOL_ITERATIONS = 10;
 
+const CHAT_WRAPPERS = {
+  qwen3: 'QwenChatWrapper',
+  granite: 'ChatMLChatWrapper',
+  llama3: 'Llama3_1ChatWrapper'
+};
+
+/**
+ * Get an explicit chat wrapper instance for a given model type.
+ * Forces the correct wrapper rather than relying on auto-detection.
+ * @param {object} node_llama - node-llama-cpp module
+ * @param {string} model_type
+ * @returns {object|undefined}
+ */
+function get_chat_wrapper(node_llama, model_type) {
+  const wrapper_name = CHAT_WRAPPERS[model_type];
+  return wrapper_name ? new node_llama[wrapper_name]() : undefined;
+}
+
 let DEBUG = false;
 
 /**
@@ -243,7 +261,8 @@ export class OllamaServer {
    * @param {object} res - HTTP response object
    */
   async execute_chat(entry, messages, request_tools, stream, res) {
-    const { LlamaChatSession } = await import('node-llama-cpp');
+    const node_llama = await import('node-llama-cpp');
+    const { LlamaChatSession } = node_llama;
 
     debug_log('execute_chat start', {
       model: entry.name,
@@ -268,12 +287,15 @@ export class OllamaServer {
     debug_log('creating context with size:', entry.config.context_size);
 
     const context = await entry.model.createContext({
-      contextSize: entry.config.context_size
+      contextSize: entry.config.context_size,
+      ignoreMemorySafetyChecks: true
     });
     const sequence = context.getSequence();
+    const chat_wrapper = get_chat_wrapper(node_llama, entry.model_type);
     const session = new LlamaChatSession({
       contextSequence: sequence,
-      systemPrompt: effective_system
+      systemPrompt: effective_system,
+      chatWrapper: chat_wrapper
     });
 
     debug_log(
@@ -572,7 +594,8 @@ export class OllamaServer {
    * @param {object} res - HTTP response object
    */
   async execute_chat_openai(entry, messages, request_tools, stream, res) {
-    const { LlamaChatSession } = await import('node-llama-cpp');
+    const node_llama = await import('node-llama-cpp');
+    const { LlamaChatSession } = node_llama;
 
     const system_prompt = this.build_system_prompt(entry, request_tools);
 
@@ -587,12 +610,15 @@ export class OllamaServer {
     }
 
     const context = await entry.model.createContext({
-      contextSize: entry.config.context_size
+      contextSize: entry.config.context_size,
+      ignoreMemorySafetyChecks: true
     });
     const sequence = context.getSequence();
+    const chat_wrapper = get_chat_wrapper(node_llama, entry.model_type);
     const session = new LlamaChatSession({
       contextSequence: sequence,
-      systemPrompt: effective_system
+      systemPrompt: effective_system,
+      chatWrapper: chat_wrapper
     });
 
     try {

@@ -6,6 +6,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 
 /**
  * Manages multiple MCP server connections
@@ -44,8 +45,42 @@ export class McpClientManager {
 
     let transport;
 
-    if (transport_type === 'http') {
-      transport = new StreamableHTTPClientTransport(new URL(config.url));
+    if (transport_type === 'http' || transport_type === 'sse') {
+      const request_init = config.headers
+        ? { headers: config.headers }
+        : undefined;
+
+      if (transport_type === 'sse') {
+        transport = new SSEClientTransport(new URL(config.url), {
+          requestInit: request_init
+        });
+      } else {
+        // Try Streamable HTTP first, fall back to SSE
+        try {
+          const probe_transport = new StreamableHTTPClientTransport(
+            new URL(config.url),
+            { requestInit: request_init }
+          );
+          const probe_client = new Client({
+            name: 'llama-mcp-host',
+            version: '1.0.0'
+          });
+          await probe_client.connect(probe_transport);
+          await probe_client.close();
+
+          transport = new StreamableHTTPClientTransport(
+            new URL(config.url),
+            { requestInit: request_init }
+          );
+        } catch {
+          console.log(
+            `  Streamable HTTP failed for ${name}, falling back to SSE...`
+          );
+          transport = new SSEClientTransport(new URL(config.url), {
+            requestInit: request_init
+          });
+        }
+      }
     } else {
       // Default to stdio
       const { command, args = [], cwd, env } = config;

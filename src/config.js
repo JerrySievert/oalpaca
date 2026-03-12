@@ -8,13 +8,14 @@ const mcp_stdio_server_schema = z.object({
   command: z.string(),
   args: z.array(z.string()).optional().default([]),
   cwd: z.string().optional(),
-  env: z.record(z.string()).optional()
+  env: z.record(z.string(), z.string()).optional()
 });
 
 const mcp_http_server_schema = z.object({
   name: z.string(),
-  transport: z.literal('http'),
-  url: z.string().url()
+  transport: z.enum(['http', 'sse']),
+  url: z.string().url(),
+  headers: z.record(z.string(), z.string()).optional()
 });
 
 const mcp_server_schema = z.union([

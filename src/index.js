@@ -110,11 +110,13 @@ async function main() {
     llama = await getLlama();
 
     model = await llama.loadModel({
-      modelPath: model_config.model_path
+      modelPath: model_config.model_path,
+      gpuLayers: model_config.gpu_layers
     });
 
     context = await model.createContext({
-      contextSize: model_config.context_size
+      contextSize: model_config.context_size,
+      ignoreMemorySafetyChecks: true
     });
 
     console.log(`Model loaded: ${selected_name}`);

@@ -2,7 +2,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock node-llama-cpp
 vi.mock('node-llama-cpp', () => ({
-  LlamaChatSession: vi.fn()
+  LlamaChatSession: vi.fn(),
+  QwenChatWrapper: vi.fn(),
+  ChatMLChatWrapper: vi.fn(),
+  Llama3_1ChatWrapper: vi.fn()
 }));
 
 import { ChatController } from '../src/chat_controller.js';

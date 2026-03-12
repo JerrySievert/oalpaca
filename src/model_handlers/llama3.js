@@ -19,7 +19,7 @@ export function format_tools_for_prompt(tools) {
     parameters: tool.inputSchema || { type: 'object', properties: {} }
   }));
 
-  const tools_json = formatted_tools.map(t => JSON.stringify(t, null, 2)).join('\n\n');
+  const tools_json = formatted_tools.map(t => JSON.stringify(t)).join('\n');
 
   return `
 

@@ -33,7 +33,7 @@ You have access to the following tools. To use a tool, respond with a tool call 
 </tool_call>
 
 Available tools:
-${JSON.stringify(formatted_tools, null, 2)}
+${JSON.stringify(formatted_tools)}
 
 When you need to use a tool, output the tool call and wait for the result. You may call multiple tools if needed.
 After receiving tool results, continue your response.`;

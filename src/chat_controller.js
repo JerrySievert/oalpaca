@@ -5,6 +5,12 @@
 
 import { get_handler } from './model_handlers/index.js';
 
+const CHAT_WRAPPERS = {
+  qwen3: 'QwenChatWrapper',
+  granite: 'ChatMLChatWrapper',
+  llama3: 'Llama3_1ChatWrapper'
+};
+
 const MAX_TOOL_ITERATIONS = 10;
 
 /**
@@ -43,7 +49,8 @@ export class ChatController {
    * Initialize the chat session with tools
    */
   async initialize() {
-    const { LlamaChatSession } = await import('node-llama-cpp');
+    const node_llama = await import('node-llama-cpp');
+    const { LlamaChatSession } = node_llama;
 
     // Get available tools and format them for the model
     const tools = this.mcp_manager.get_all_tools();
@@ -56,9 +63,13 @@ export class ChatController {
     const full_system_prompt =
       this.system_prompt + date_time_str + tools_prompt;
 
+    const wrapper_name = CHAT_WRAPPERS[this.model_type];
+    const chat_wrapper = wrapper_name ? new node_llama[wrapper_name]() : undefined;
+
     this.session = new LlamaChatSession({
       contextSequence: this.context.getSequence(),
-      systemPrompt: full_system_prompt
+      systemPrompt: full_system_prompt,
+      chatWrapper: chat_wrapper
     });
 
     console.log(`\nChat initialized with ${tools.length} tools available.`);
