@@ -2,9 +2,9 @@
 
 ![An Irish Alpaca next to a pot of gold with a rainbow behind it](image/logo.jpg "O'Alpaca")
 
-A CLI and HTTP server that connects local LLM models (via [node-llama-cpp](https://github.com/withcatai/node-llama-cpp)) with [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) servers, giving your locally-running models the ability to use tools. Presents itself as Ollama for compatibility with Ollama-compatible clients.
+A CLI and HTTP server that connects LLM models with [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) servers, giving your models the ability to use tools. Supports both **local models** (via [node-llama-cpp](https://github.com/withcatai/node-llama-cpp)) and **remote models** (via [OpenRouter](https://openrouter.ai/)). Presents itself as Ollama for compatibility with Ollama-compatible clients.
 
-Supports **Qwen3**, **Llama 3.2**, and **Granite 3.2** models out of the box with automatic model detection and the correct tool-calling format for each family.
+Supports **Qwen3**, **Llama 3.2**, and **Granite 3.2** local models out of the box with automatic model detection and the correct tool-calling format for each family. Remote models via OpenRouter use native OpenAI-format tool calling with automatic fallback to text-based tool call parsing.
 
 ## Features
 
@@ -12,18 +12,21 @@ Supports **Qwen3**, **Llama 3.2**, and **Granite 3.2** models out of the box wit
 - **Interactive CLI chat** with tool use
 - **Ollama-compatible HTTP server** (`/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/show`) and **OpenAI-compatible endpoints** (`/v1/chat/completions`, `/v1/models`)
 - **MCP tool integration** -- connect any MCP server and the model can call its tools automatically
-- **Memory-aware model management** -- LRU eviction with VRAM estimation so multiple models can share limited GPU memory
+- **Local + remote models** -- run GGUF models locally or proxy to OpenRouter for access to cloud models (Qwen 3.6, Step 3.5 Flash, and hundreds more)
+- **Memory-aware model management** -- LRU eviction with VRAM estimation so multiple local models can share limited GPU memory
 - **Fair request scheduling** -- batches same-model requests to minimize load/unload cycles, with streaming heartbeats while requests wait in queue
 - **Bearer token authentication** -- optionally restrict access with per-token model visibility
 - **Multi-model support** -- auto-detects Qwen3 (Hermes-style), Llama 3.2 (Pythonic), and Granite 3.2 tool-calling formats
 - **Tool call resilience** -- detects repeated identical tool calls and breaks out of loops, provides parameter guidance on failed/empty results
+- **Automatic retry on rate limits** -- OpenRouter 429/502/503 errors are retried with exponential backoff
 - **Automatic time awareness** -- current date and time are appended to the system prompt so models can answer time-sensitive questions
-- Hardware-accelerated inference via Metal (macOS), CUDA, and Vulkan
+- Hardware-accelerated inference via Metal (macOS), CUDA, and Vulkan for local models
 
 ## Prerequisites
 
 - **Node.js** >= 18
-- A **GGUF model file** (see [Downloading Models](#downloading-models) below)
+- For local models: a **GGUF model file** (see [Downloading Models](#downloading-models) below)
+- For remote models: an **OpenRouter API key** (see [OpenRouter Models](#openrouter-remote-models) below)
 
 ## Installation
 
@@ -149,6 +152,100 @@ Each entry under `models` supports the following fields:
 | `context_size`       | number | no       | `8192`        | Context window size in tokens                              |
 | `gpu_layers`         | number | no       |               | Number of layers to offload to GPU                         |
 | `mcp_servers`        | array  | no       | `[]`          | MCP servers to connect to (see below)                      |
+
+### OpenRouter (Remote Models)
+
+In addition to running models locally, you can proxy requests to [OpenRouter](https://openrouter.ai/) to access cloud-hosted models. OpenRouter models get the same MCP tool integration as local models -- tool calls are intercepted and executed locally via your configured MCP servers.
+
+To use an OpenRouter model, set `"provider": "openrouter"` and specify the `openrouter_model` ID instead of a `model_path`:
+
+```json
+{
+  "models": {
+    "qwen-cloud": {
+      "provider": "openrouter",
+      "openrouter_model": "qwen/qwen3.6-plus:free",
+      "api_key": "sk-or-v1-...",
+      "model_type": "qwen3",
+      "system_prompt": "You are a helpful assistant.",
+      "context_size": 32768,
+      "mcp_servers": [
+        {
+          "name": "my-tools",
+          "transport": "stdio",
+          "command": "node",
+          "args": ["/path/to/mcp-server/index.js"]
+        }
+      ]
+    },
+    "step-flash": {
+      "provider": "openrouter",
+      "openrouter_model": "stepfun/step-3.5-flash:free",
+      "model_type": "qwen3",
+      "system_prompt_file": "./system_prompt.txt",
+      "mcp_servers": []
+    }
+  }
+}
+```
+
+You can mix local and remote models in the same config -- clients will see all of them in the model list.
+
+#### OpenRouter Model Entry Options
+
+| Field              | Type   | Required | Default       | Description                                                            |
+| ------------------ | ------ | -------- | ------------- | ---------------------------------------------------------------------- |
+| `provider`         | string | yes      |               | Must be `"openrouter"`                                                 |
+| `openrouter_model` | string | yes      |               | Model ID on OpenRouter (e.g. `qwen/qwen3.6-plus:free`)                |
+| `api_key`          | string | no       |               | OpenRouter API key (falls back to `OPENROUTER_API_KEY` env var)        |
+| `model_type`       | string | no       | auto-detected | Tool format handler: `"qwen3"`, `"llama3"`, or `"granite"`            |
+| `temperature`      | number | no       |               | Sampling temperature                                                   |
+| `top_p`            | number | no       |               | Top-p (nucleus) sampling                                               |
+| `max_tokens`       | number | no       |               | Maximum tokens to generate                                             |
+| `system_prompt`    | string | no       |               | Inline system prompt                                                   |
+| `system_prompt_file` | string | no     |               | Path to a text file containing the system prompt                       |
+| `assistant_name`   | string | no       | `"Assistant"` | Display name for the assistant                                         |
+| `context_size`     | number | no       | `32768`       | Context window size in tokens                                          |
+| `mcp_servers`      | array  | no       | `[]`          | MCP servers to connect to (same format as local models)                |
+
+#### API Key Configuration
+
+You can provide your OpenRouter API key in two ways:
+
+1. **Per-model in config.json** -- set the `api_key` field on each OpenRouter model entry
+2. **Environment variable** -- set `OPENROUTER_API_KEY` and omit the `api_key` field
+
+```bash
+# Using environment variable
+export OPENROUTER_API_KEY=sk-or-v1-...
+node src/server.js
+```
+
+If neither is set, the server will fail at startup with a clear error message.
+
+#### How Tool Calling Works with OpenRouter
+
+OpenRouter models use the OpenAI-compatible API, which supports native function/tool calling. The server:
+
+1. Converts MCP tool schemas to OpenAI function format and sends them with each request
+2. If the model responds with native `tool_calls`, executes them via MCP and feeds results back
+3. If the model instead responds with text-based tool calls (e.g. `<tool_call>` tags), falls back to the same text parsing used for local models
+4. Repeats until the model produces a final text response or the iteration limit is reached
+
+This dual-path approach means OpenRouter models work whether or not they support native function calling in the API.
+
+#### Rate Limit Handling
+
+OpenRouter (especially free-tier models) can return 429 rate limit errors. The server automatically retries with exponential backoff:
+
+- Up to **5 retries** starting at a 2-second delay
+- Respects the `Retry-After` header when present
+- Adds jitter to avoid thundering herd
+- Also retries on 502/503 upstream errors
+
+#### Finding Model IDs
+
+Browse available models at [openrouter.ai/models](https://openrouter.ai/models). The model ID is what you put in the `openrouter_model` field. Free-tier models have a `:free` suffix (e.g. `qwen/qwen3.6-plus:free`).
 
 ### Adding MCP Servers
 
@@ -305,9 +402,10 @@ The server can serve multiple models simultaneously. Models are loaded into memo
 ### How It Works
 
 - **On-demand loading** -- models are loaded when a request arrives for them, not at startup. Only GGUF metadata is read at startup for memory estimation.
-- **LRU eviction** -- when a new model needs to be loaded and the cap is reached (default: 3 loaded models), the least recently used model with no active requests is unloaded.
+- **LRU eviction** -- when a new local model needs to be loaded and the cap is reached (default: 3 loaded models), the least recently used model with no active requests is unloaded.
 - **Memory-aware** -- before loading, the server estimates VRAM requirements using `GgufInsights` and checks available VRAM via `getVramState()`. If there isn't enough memory, models are evicted until there is.
 - **Active context protection** -- models with in-flight requests cannot be evicted.
+- **Remote models** -- OpenRouter models don't consume local GPU memory and are not counted toward the loaded model cap. The llama.cpp backend is only initialized if at least one local model is configured.
 
 ### Request Scheduling
 
@@ -329,12 +427,13 @@ The server includes safeguards to prevent models from getting stuck in tool-call
 
 ### Operational Limits
 
-| Limit               | Value  | Description                                        |
-| ------------------- | ------ | -------------------------------------------------- |
-| Max loaded models   | 3      | Maximum models held in memory simultaneously       |
-| Max tool iterations | 10     | Maximum tool call rounds per request               |
-| VRAM safety reserve | 512 MB | Memory buffer kept free when estimating model fit  |
-| Heartbeat interval  | 3s     | Frequency of keep-alive chunks for queued requests |
+| Limit               | Value  | Description                                                          |
+| ------------------- | ------ | -------------------------------------------------------------------- |
+| Max loaded models   | 3      | Maximum local models held in memory (remote models don't count)      |
+| Max tool iterations | 10     | Maximum tool call rounds per request                                 |
+| VRAM safety reserve | 512 MB | Memory buffer kept free when estimating model fit                    |
+| Heartbeat interval  | 3s     | Frequency of keep-alive chunks for queued requests                   |
+| OpenRouter retries  | 5      | Maximum retry attempts on 429/502/503 with exponential backoff       |
 
 ## Bearer Token Authentication
 
@@ -416,6 +515,7 @@ llama-mcp-host/
 │   ├── token_cli.js           # CLI tool for managing tokens
 │   ├── mcp_client.js          # MCP server connection manager
 │   ├── chat_controller.js     # CLI conversation loop & tool execution
+│   ├── openrouter_client.js   # OpenRouter API client (fetch, retry, streaming)
 │   └── model_handlers/
 │       ├── index.js           # Handler factory
 │       ├── qwen3.js           # Qwen3 tool format (Hermes-style)
@@ -448,6 +548,11 @@ llama-mcp-host/
 │   Qwen3 Handler      │  Llama3 Handler  │  Granite Handler  │
 │   <tool_call> tags   │  [func()] syntax │  <tool_call> tags │
 ├──────────────────────┴──────────────────┴───────────────────┤
+│                   OpenRouter Client                         │
+│  - OpenAI-compatible API for remote models                  │
+│  - Native tool calling with text fallback                   │
+│  - Automatic retry on 429/502/503                           │
+├─────────────────────────────────────────────────────────────┤
 │                      MCP Client Manager                     │
 │  - Per-model server connections (stdio & HTTP)              │
 │  - Tool schema conversion per model format                  │

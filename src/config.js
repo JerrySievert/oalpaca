@@ -23,7 +23,8 @@ const mcp_server_schema = z.union([
   mcp_http_server_schema
 ]);
 
-const model_entry_schema = z.object({
+const local_model_entry_schema = z.object({
+  provider: z.literal('local').optional().default('local'),
   model_path: z.string(),
   model_type: z.enum(['qwen3', 'llama3', 'granite']).optional(),
   system_prompt_file: z.string().optional(),
@@ -33,6 +34,26 @@ const model_entry_schema = z.object({
   assistant_name: z.string().optional().default('Assistant'),
   mcp_servers: z.array(mcp_server_schema).optional().default([])
 });
+
+const openrouter_model_entry_schema = z.object({
+  provider: z.literal('openrouter'),
+  openrouter_model: z.string(),
+  api_key: z.string().optional(),
+  model_type: z.enum(['qwen3', 'llama3', 'granite']).optional(),
+  system_prompt_file: z.string().optional(),
+  system_prompt: z.string().optional(),
+  context_size: z.number().optional().default(32768),
+  temperature: z.number().optional(),
+  top_p: z.number().optional(),
+  max_tokens: z.number().optional(),
+  assistant_name: z.string().optional().default('Assistant'),
+  mcp_servers: z.array(mcp_server_schema).optional().default([])
+});
+
+const model_entry_schema = z.discriminatedUnion('provider', [
+  local_model_entry_schema,
+  openrouter_model_entry_schema
+]).or(local_model_entry_schema);
 
 const config_schema = z.object({
   models: z.record(z.string(), model_entry_schema)
@@ -57,7 +78,21 @@ export function load_config(config_path) {
 
   // Resolve relative paths for each model entry
   for (const [name, entry] of Object.entries(config.models)) {
-    entry.model_path = resolve(config_dir, entry.model_path);
+    const is_remote = entry.provider === 'openrouter';
+
+    if (!is_remote) {
+      entry.model_path = resolve(config_dir, entry.model_path);
+    }
+
+    // Resolve OpenRouter API key from config or environment
+    if (is_remote && !entry.api_key) {
+      entry.api_key = process.env.OPENROUTER_API_KEY;
+      if (!entry.api_key) {
+        throw new Error(
+          `Model "${name}": OpenRouter api_key not set in config or OPENROUTER_API_KEY env var`
+        );
+      }
+    }
 
     if (entry.system_prompt_file) {
       const prompt_path = resolve(config_dir, entry.system_prompt_file);

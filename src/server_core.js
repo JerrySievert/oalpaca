@@ -8,6 +8,14 @@ import { createServer } from 'http';
 import { get_models_for_token } from './token_manager.js';
 import { ModelManager } from './model_manager.js';
 import { RequestScheduler } from './request_scheduler.js';
+import {
+  mcp_tools_to_openai,
+  parse_openai_tool_calls,
+  build_tool_result_messages,
+  chat_completion,
+  chat_completion_stream,
+  RetryTracker
+} from './openrouter_client.js';
 
 const DEFAULT_CONFIG_PATH = './config.json';
 const DEFAULT_PORT = 9000;
@@ -50,6 +58,28 @@ export function debug_log(...args) {
   if (DEBUG) {
     console.log(`[DEBUG ${new Date().toISOString()}]`, ...args);
   }
+}
+
+/**
+ * Format the current date, time, timezone, and UTC offset for injection into system prompts.
+ * @returns {string}
+ */
+function format_current_datetime() {
+  const now = new Date();
+  const formatted = now.toLocaleString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'long'
+  });
+  const tz_short = Intl.DateTimeFormat('en-US', { timeZoneName: 'short' }).formatToParts(now)
+    .find(p => p.type === 'timeZoneName')?.value || '';
+  const offset_minutes = now.getTimezoneOffset();
+  const offset_sign = offset_minutes <= 0 ? '+' : '-';
+  const offset_hours = String(Math.floor(Math.abs(offset_minutes) / 60)).padStart(2, '0');
+  const offset_mins = String(Math.abs(offset_minutes) % 60).padStart(2, '0');
+  const utc_offset = `UTC${offset_sign}${offset_hours}:${offset_mins}`;
+  const tz_name = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  return `Current date and time: ${formatted}\nTimezone: ${tz_name} (${tz_short}, ${utc_offset})`;
 }
 
 /**
@@ -228,9 +258,8 @@ export class OllamaServer {
   build_system_prompt(entry, request_tools) {
     let system_prompt = entry.config.system_prompt || '';
 
-    // Append current date and time so the model has a concept of time
-    const now = new Date();
-    system_prompt += `\n\nCurrent date and time: ${now.toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' })}`;
+    // Append current date, time, and timezone so the model has a concept of time
+    system_prompt += `\n\n${format_current_datetime()}`;
 
     // Use request tools if provided, otherwise use the model's MCP tools
     const tools_to_use = request_tools || entry.tools;
@@ -771,6 +800,462 @@ export class OllamaServer {
   }
 
   /**
+   * Execute a chat completion against an OpenRouter remote model.
+   * Sends messages to the OpenRouter API and intercepts tool calls,
+   * executing them via MCP just like local models.
+   * @param {object} entry - LoadedModelEntry
+   * @param {Array} messages - Chat messages
+   * @param {Array|null} request_tools - Tools from the request (Ollama format)
+   * @param {boolean} stream - Whether to stream the response
+   * @param {object} res - HTTP response object
+   */
+  async execute_chat_openrouter(entry, messages, request_tools, stream, res) {
+    const config = entry.config;
+
+    debug_log('execute_chat_openrouter start', {
+      model: entry.name,
+      openrouter_model: config.openrouter_model,
+      stream,
+      message_count: messages.length
+    });
+
+    // Build system prompt with tools
+    const system_prompt = this.build_system_prompt_openrouter(entry, request_tools);
+
+    // Build OpenAI-format messages
+    const api_messages = [];
+    if (system_prompt) {
+      api_messages.push({ role: 'system', content: system_prompt });
+    }
+
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        // Merge with our system prompt
+        api_messages[0] = {
+          role: 'system',
+          content: msg.content + '\n' + (api_messages[0]?.content || system_prompt)
+        };
+      } else {
+        api_messages.push({ role: msg.role, content: msg.content });
+      }
+    }
+
+    // Determine tools to send to OpenRouter
+    const tools_to_use = request_tools || entry.tools;
+    const openai_tools = mcp_tools_to_openai(tools_to_use);
+
+    const created_at = new Date().toISOString();
+    const retry_tracker = new RetryTracker();
+    let iteration = 0;
+    let final_response = '';
+    let tool_calls_made = [];
+    let recent_call_signatures = [];
+
+    // Keepalive callback: ensures streaming headers are sent and emits empty chunks
+    // so the client doesn't timeout while we retry rate-limited requests
+    const on_waiting = stream ? () => {
+      if (!res.headersSent) {
+        res.writeHead(200, {
+          'Content-Type': 'application/x-ndjson',
+          'Transfer-Encoding': 'chunked',
+          'Access-Control-Allow-Origin': '*'
+        });
+      }
+      if (!res.writableEnded) {
+        send_chunk(res, {
+          model: entry.name,
+          created_at,
+          message: { role: 'assistant', content: '' },
+          done: false
+        });
+      }
+    } : null;
+
+    while (iteration < MAX_TOOL_ITERATIONS) {
+      iteration++;
+      debug_log(`openrouter iteration ${iteration}`);
+
+      const api_result = await chat_completion({
+        api_key: config.api_key,
+        model: config.openrouter_model,
+        messages: api_messages,
+        tools: openai_tools,
+        temperature: config.temperature,
+        top_p: config.top_p,
+        max_tokens: config.max_tokens,
+        debug_log,
+        retry_tracker,
+        on_waiting
+      });
+
+      const choice = api_result.choices?.[0];
+      if (!choice) {
+        final_response = 'No response from model.';
+        break;
+      }
+
+      const assistant_msg = choice.message;
+      const content = assistant_msg.content || '';
+
+      // Check for native OpenAI-format tool calls first
+      let tool_calls = parse_openai_tool_calls(assistant_msg);
+      let used_text_tool_calls = false;
+
+      // Fallback: check if the model responded with text-based tool calls
+      // (e.g. <tool_call> tags) instead of using the native API format
+      if (tool_calls.length === 0 && content && entry.handler.has_tool_calls(content)) {
+        debug_log('openrouter: no native tool_calls, falling back to text-based parsing');
+        const text_calls = entry.handler.parse_tool_calls(content);
+        if (text_calls.length > 0) {
+          tool_calls = text_calls.map((tc, i) => ({
+            id: `text_call_${Date.now()}_${i}`,
+            name: tc.name,
+            arguments: tc.arguments
+          }));
+          used_text_tool_calls = true;
+        }
+      }
+
+      if (tool_calls.length === 0) {
+        // No tool calls — this is the final response
+        final_response = content;
+        break;
+      }
+
+      // Detect repeated identical tool calls
+      const call_signature = JSON.stringify(
+        tool_calls.map(c => ({ name: c.name, arguments: c.arguments }))
+      );
+      recent_call_signatures.push(call_signature);
+      const repeat_count = recent_call_signatures.filter(s => s === call_signature).length;
+
+      if (repeat_count >= 3) {
+        debug_log('openrouter: detected repeated tool call loop:', call_signature.slice(0, 200));
+        const tool_names = tool_calls.map(c => c.name).join(', ');
+        final_response =
+          `I wasn't able to get the right information — I kept trying to call ${tool_names} ` +
+          `with the same arguments without success. Could you try rephrasing your question ` +
+          `or providing more specific details?`;
+        break;
+      }
+
+      // Add assistant message to conversation
+      if (used_text_tool_calls) {
+        // For text-based tool calls, just add the content as assistant message
+        api_messages.push({ role: 'assistant', content });
+      } else {
+        api_messages.push({
+          role: 'assistant',
+          content,
+          tool_calls: assistant_msg.tool_calls
+        });
+      }
+
+      // Execute tool calls via MCP
+      const results = [];
+      for (const call of tool_calls) {
+        debug_log(`MCP call: ${call.name}(${JSON.stringify(call.arguments)})`);
+        const mcp_start = Date.now();
+        try {
+          const result = await entry.mcp_manager.call_tool(call.name, call.arguments);
+          const mcp_ms = Date.now() - mcp_start;
+          debug_log(`MCP result for ${call.name} in ${mcp_ms}ms:`, String(result).slice(0, 300));
+          results.push({ id: call.id, name: call.name, result, success: true });
+          tool_calls_made.push({
+            function: { name: call.name, arguments: call.arguments }
+          });
+        } catch (error) {
+          const mcp_ms = Date.now() - mcp_start;
+          debug_log(`MCP error for ${call.name} in ${mcp_ms}ms:`, error.message);
+          results.push({ id: call.id, name: call.name, result: error.message, success: false });
+        }
+      }
+
+      // Add tool results as messages
+      if (used_text_tool_calls) {
+        // For text-based tool calls, format results as user message
+        const formatted_parts = results.map(r =>
+          entry.handler.format_tool_result(r.name, r.result)
+        );
+        api_messages.push({ role: 'user', content: formatted_parts.join('\n\n') });
+      } else {
+        const tool_result_messages = build_tool_result_messages(results);
+        api_messages.push(...tool_result_messages);
+      }
+    }
+
+    if (iteration >= MAX_TOOL_ITERATIONS && !final_response) {
+      final_response =
+        'I was unable to complete this request — too many tool calls were needed. ' +
+        'Please try rephrasing your question or providing more specific details.';
+    }
+
+    // Send response to client
+    if (stream) {
+      if (!res.headersSent) {
+        res.writeHead(200, {
+          'Content-Type': 'application/x-ndjson',
+          'Transfer-Encoding': 'chunked',
+          'Access-Control-Allow-Origin': '*'
+        });
+      }
+
+      if (final_response) {
+        const words = final_response.split(' ');
+        for (let i = 0; i < words.length; i++) {
+          const chunk = i === 0 ? words[i] : ' ' + words[i];
+          send_chunk(res, {
+            model: entry.name,
+            created_at,
+            message: { role: 'assistant', content: chunk },
+            done: false
+          });
+        }
+      }
+      send_chunk(res, {
+        model: entry.name,
+        created_at,
+        message: { role: 'assistant', content: '' },
+        done: true,
+        done_reason: 'stop',
+        total_duration: 0,
+        load_duration: 0,
+        prompt_eval_count: 0,
+        prompt_eval_duration: 0,
+        eval_count: 0,
+        eval_duration: 0
+      });
+      res.end();
+      debug_log('openrouter streaming response ended');
+    } else {
+      const response_message = { role: 'assistant', content: final_response };
+      if (tool_calls_made.length > 0) {
+        response_message.tool_calls = tool_calls_made;
+      }
+
+      send_json(res, 200, {
+        model: entry.name,
+        created_at,
+        message: response_message,
+        done: true,
+        done_reason: 'stop',
+        total_duration: 0,
+        load_duration: 0,
+        prompt_eval_count: 0,
+        prompt_eval_duration: 0,
+        eval_count: 0,
+        eval_duration: 0
+      });
+    }
+  }
+
+  /**
+   * Execute a chat completion in OpenAI format against an OpenRouter model.
+   * @param {object} entry - LoadedModelEntry
+   * @param {Array} messages - Chat messages
+   * @param {Array|null} request_tools - Tools from the request
+   * @param {boolean} stream - Whether to stream the response
+   * @param {object} res - HTTP response object
+   */
+  async execute_chat_openai_openrouter(entry, messages, request_tools, stream, res) {
+    const config = entry.config;
+
+    const system_prompt = this.build_system_prompt_openrouter(entry, request_tools);
+
+    const api_messages = [];
+    if (system_prompt) {
+      api_messages.push({ role: 'system', content: system_prompt });
+    }
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        api_messages[0] = {
+          role: 'system',
+          content: msg.content + '\n' + (api_messages[0]?.content || system_prompt)
+        };
+      } else {
+        api_messages.push({ role: msg.role, content: msg.content });
+      }
+    }
+
+    const tools_to_use = request_tools || entry.tools;
+    const openai_tools = mcp_tools_to_openai(tools_to_use);
+
+    const retry_tracker = new RetryTracker();
+    let iteration = 0;
+    let final_response = '';
+    let tool_calls_made = [];
+
+    // Keepalive for OpenAI SSE streaming
+    const on_waiting_v1 = stream ? () => {
+      if (!res.headersSent) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          'Access-Control-Allow-Origin': '*'
+        });
+      }
+      if (!res.writableEnded) {
+        const created = Math.floor(Date.now() / 1000);
+        res.write(`data: ${JSON.stringify({
+          id: `chatcmpl-${Date.now()}`,
+          object: 'chat.completion.chunk',
+          created,
+          model: entry.name,
+          choices: [{ index: 0, delta: { content: '' }, finish_reason: null }]
+        })}\n\n`);
+      }
+    } : null;
+
+    while (iteration < MAX_TOOL_ITERATIONS) {
+      iteration++;
+
+      const api_result = await chat_completion({
+        api_key: config.api_key,
+        model: config.openrouter_model,
+        messages: api_messages,
+        tools: openai_tools,
+        temperature: config.temperature,
+        top_p: config.top_p,
+        max_tokens: config.max_tokens,
+        debug_log,
+        retry_tracker,
+        on_waiting: on_waiting_v1
+      });
+
+      const choice = api_result.choices?.[0];
+      if (!choice) {
+        final_response = 'No response from model.';
+        break;
+      }
+
+      const assistant_msg = choice.message;
+      const content_v1 = assistant_msg.content || '';
+
+      let tool_calls = parse_openai_tool_calls(assistant_msg);
+      let used_text_calls_v1 = false;
+
+      // Fallback: text-based tool calls (e.g. <tool_call> tags)
+      if (tool_calls.length === 0 && content_v1 && entry.handler.has_tool_calls(content_v1)) {
+        const text_calls = entry.handler.parse_tool_calls(content_v1);
+        if (text_calls.length > 0) {
+          tool_calls = text_calls.map((tc, i) => ({
+            id: `text_call_${Date.now()}_${i}`,
+            name: tc.name,
+            arguments: tc.arguments
+          }));
+          used_text_calls_v1 = true;
+        }
+      }
+
+      if (tool_calls.length === 0) {
+        final_response = content_v1;
+        break;
+      }
+
+      if (used_text_calls_v1) {
+        api_messages.push({ role: 'assistant', content: content_v1 });
+      } else {
+        api_messages.push({
+          role: 'assistant',
+          content: content_v1,
+          tool_calls: assistant_msg.tool_calls
+        });
+      }
+
+      const results = [];
+      for (const call of tool_calls) {
+        try {
+          const result = await entry.mcp_manager.call_tool(call.name, call.arguments);
+          results.push({ id: call.id, name: call.name, result, success: true });
+          tool_calls_made.push({
+            id: call.id,
+            type: 'function',
+            function: { name: call.name, arguments: JSON.stringify(call.arguments) }
+          });
+        } catch (error) {
+          results.push({ id: call.id, name: call.name, result: error.message, success: false });
+        }
+      }
+
+      if (used_text_calls_v1) {
+        const formatted_parts = results.map(r =>
+          entry.handler.format_tool_result(r.name, r.result)
+        );
+        api_messages.push({ role: 'user', content: formatted_parts.join('\n\n') });
+      } else {
+        api_messages.push(...build_tool_result_messages(results));
+      }
+    }
+
+    const created = Math.floor(Date.now() / 1000);
+    const completion_id = `chatcmpl-${Date.now()}`;
+
+    if (stream) {
+      if (!res.headersSent) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          'Access-Control-Allow-Origin': '*'
+        });
+      }
+
+      const words = final_response.split(' ');
+      for (let i = 0; i < words.length; i++) {
+        const chunk = i === 0 ? words[i] : ' ' + words[i];
+        res.write(`data: ${JSON.stringify({
+          id: completion_id,
+          object: 'chat.completion.chunk',
+          created,
+          model: entry.name,
+          choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }]
+        })}\n\n`);
+      }
+
+      res.write(`data: ${JSON.stringify({
+        id: completion_id,
+        object: 'chat.completion.chunk',
+        created,
+        model: entry.name,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+      })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      const response_message = { role: 'assistant', content: final_response };
+      if (tool_calls_made.length > 0) {
+        response_message.tool_calls = tool_calls_made;
+      }
+
+      send_json(res, 200, {
+        id: completion_id,
+        object: 'chat.completion',
+        created,
+        model: entry.name,
+        choices: [{ index: 0, message: response_message, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+      });
+    }
+  }
+
+  /**
+   * Build system prompt for an OpenRouter model.
+   * Unlike local models, we don't inject tool formatting into the prompt —
+   * tools are passed natively via the API. Only the base system prompt + datetime.
+   * @param {object} entry - LoadedModelEntry
+   * @param {Array|null} request_tools - Tools from the request
+   * @returns {string}
+   */
+  build_system_prompt_openrouter(entry, request_tools) {
+    let system_prompt = entry.config.system_prompt || '';
+
+    system_prompt += `\n\n${format_current_datetime()}`;
+
+    return system_prompt;
+  }
+
+  /**
    * Route and handle an incoming HTTP request.
    * @param {import('http').IncomingMessage} req - HTTP request
    * @param {import('http').ServerResponse} res - HTTP response
@@ -942,10 +1427,15 @@ export class OllamaServer {
           return;
         }
 
+        const is_remote_chat = this.model_manager.get_model_config(model_name)?.provider === 'openrouter';
         await this.scheduler.submit(
           model_name,
           async (entry) => {
-            await this.execute_chat(entry, messages, tools, stream, res);
+            if (is_remote_chat) {
+              await this.execute_chat_openrouter(entry, messages, tools, stream, res);
+            } else {
+              await this.execute_chat(entry, messages, tools, stream, res);
+            }
           },
           res,
           stream
@@ -979,16 +1469,27 @@ export class OllamaServer {
           return;
         }
 
+        const is_remote_gen = this.model_manager.get_model_config(model_name)?.provider === 'openrouter';
         await this.scheduler.submit(
           model_name,
           async (entry) => {
-            await this.execute_chat(
-              entry,
-              [{ role: 'user', content: prompt }],
-              null,
-              stream,
-              res
-            );
+            if (is_remote_gen) {
+              await this.execute_chat_openrouter(
+                entry,
+                [{ role: 'user', content: prompt }],
+                null,
+                stream,
+                res
+              );
+            } else {
+              await this.execute_chat(
+                entry,
+                [{ role: 'user', content: prompt }],
+                null,
+                stream,
+                res
+              );
+            }
           },
           res,
           stream
@@ -1025,10 +1526,15 @@ export class OllamaServer {
           return;
         }
 
+        const is_remote_openai = this.model_manager.get_model_config(model_name)?.provider === 'openrouter';
         await this.scheduler.submit(
           model_name,
           async (entry) => {
-            await this.execute_chat_openai(entry, messages, tools, stream, res);
+            if (is_remote_openai) {
+              await this.execute_chat_openai_openrouter(entry, messages, tools, stream, res);
+            } else {
+              await this.execute_chat_openai(entry, messages, tools, stream, res);
+            }
           },
           res,
           stream

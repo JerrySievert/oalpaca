@@ -78,6 +78,7 @@ function make_model_manager(overrides = {}) {
     initialize: vi.fn().mockResolvedValue(undefined),
     get_model_names: vi.fn().mockReturnValue(['llama3:3b', 'qwen3:8b']),
     has_model: vi.fn((name) => ['llama3:3b', 'qwen3:8b'].includes(name)),
+    get_model_config: vi.fn(() => ({ provider: 'local' })),
     get_all_model_info: vi.fn((allowed) => {
       const all = [
         {

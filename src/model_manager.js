@@ -56,16 +56,37 @@ export class ModelManager {
   }
 
   /**
+   * Check if a model config is for a remote provider (e.g. OpenRouter)
+   * @param {object} model_config
+   * @returns {boolean}
+   */
+  is_remote(model_config) {
+    return model_config.provider === 'openrouter';
+  }
+
+  /**
    * Initialize the llama backend and pre-read GGUF file headers
-   * for all configured models (fast — reads metadata only, no GPU)
+   * for all configured models (fast — reads metadata only, no GPU).
+   * Remote models (OpenRouter) skip GGUF reading.
    */
   async initialize() {
-    this.llama = await getLlama();
+    // Only initialize llama if there are local models
+    const has_local = Object.values(this.config.models).some(
+      entry => !this.is_remote(entry)
+    );
+    if (has_local) {
+      this.llama = await getLlama();
+    }
 
     const model_names = Object.keys(this.config.models);
     console.log(`Configured models: ${model_names.join(', ')}`);
 
     for (const [name, entry] of Object.entries(this.config.models)) {
+      if (this.is_remote(entry)) {
+        console.log(`  ${name}: remote (${entry.provider} → ${entry.openrouter_model})`);
+        continue;
+      }
+
       try {
         const file_info = await readGgufFileInfo(entry.model_path);
         const insights = await GgufInsights.from(file_info, this.llama);
@@ -157,11 +178,18 @@ export class ModelManager {
    * @param {string} name_to_load
    */
   async _evict_if_needed(name_to_load) {
-    // Check max loaded models cap
-    let must_evict_count = Math.max(
-      0,
-      this.loaded_models.size + 1 - MAX_LOADED_MODELS
-    );
+    // Remote models don't consume local GPU memory — skip eviction
+    const model_config = this.config.models[name_to_load];
+    if (model_config && this.is_remote(model_config)) {
+      this.debug_log(`${name_to_load}: remote model, skipping eviction check`);
+      return;
+    }
+
+    // Check max loaded models cap (only count local models)
+    const local_loaded = [...this.loaded_models.values()].filter(
+      e => !this.is_remote(e.config)
+    ).length;
+    let must_evict_count = Math.max(0, local_loaded + 1 - MAX_LOADED_MODELS);
 
     // Check memory availability
     let need_memory_eviction = false;
@@ -262,10 +290,17 @@ export class ModelManager {
     console.log(`Loading model: ${name}...`);
     const load_start = Date.now();
 
-    const model = await this.llama.loadModel({
-      modelPath: model_config.model_path,
-      gpuLayers: model_config.gpu_layers
-    });
+    let model = null;
+
+    if (this.is_remote(model_config)) {
+      // Remote models don't load a local GGUF — model stays null
+      this.debug_log(`${name}: remote model, skipping local model load`);
+    } else {
+      model = await this.llama.loadModel({
+        modelPath: model_config.model_path,
+        gpuLayers: model_config.gpu_layers
+      });
+    }
 
     const mcp_manager = new McpClientManager();
     if (model_config.mcp_servers.length > 0) {
@@ -306,10 +341,12 @@ export class ModelManager {
     console.log(`Unloading model: ${name}...`);
     this.loaded_models.delete(name);
 
-    try {
-      await entry.model.dispose();
-    } catch (error) {
-      console.error(`  Error disposing model ${name}: ${error.message}`);
+    if (entry.model) {
+      try {
+        await entry.model.dispose();
+      } catch (error) {
+        console.error(`  Error disposing model ${name}: ${error.message}`);
+      }
     }
 
     try {
@@ -350,6 +387,7 @@ export class ModelManager {
       if (allowed_models && !allowed_models.includes(name)) continue;
       const insights = this.gguf_insights.get(name);
       const model_type = detect_model_type(name, model_config.model_type);
+      const is_remote = this.is_remote(model_config);
       results.push({
         name,
         model: name,
@@ -358,11 +396,11 @@ export class ModelManager {
         digest: 'sha256:' + '0'.repeat(64),
         details: {
           parent_model: '',
-          format: 'gguf',
+          format: is_remote ? 'api' : 'gguf',
           family: model_type,
           families: [model_type],
           parameter_size: '',
-          quantization_level: ''
+          quantization_level: is_remote ? 'remote' : ''
         }
       });
     }
@@ -401,18 +439,21 @@ export class ModelManager {
     if (!model_config) return null;
 
     const model_type = detect_model_type(name, model_config.model_type);
+    const is_remote = this.is_remote(model_config);
     return {
       license: '',
-      modelfile: `FROM ${model_config.model_path}`,
+      modelfile: is_remote
+        ? `FROM openrouter:${model_config.openrouter_model}`
+        : `FROM ${model_config.model_path}`,
       parameters: `num_ctx ${model_config.context_size}`,
       template: '',
       details: {
         parent_model: '',
-        format: 'gguf',
+        format: is_remote ? 'api' : 'gguf',
         family: model_type,
         families: [model_type],
         parameter_size: '',
-        quantization_level: ''
+        quantization_level: is_remote ? 'remote' : ''
       },
       model_info: {},
       modified_at: new Date().toISOString()
