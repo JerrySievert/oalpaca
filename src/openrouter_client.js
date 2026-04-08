@@ -7,6 +7,7 @@ const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 const MAX_RETRIES = 15;
 const INITIAL_RETRY_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 5000;
+const FETCH_TIMEOUT_MS = 30000;
 
 /**
  * Shared retry tracker that persists across multiple API calls within a request.
@@ -16,6 +17,30 @@ const MAX_RETRY_DELAY_MS = 5000;
 export class RetryTracker {
   constructor() {
     this.total_attempts = 0;
+  }
+}
+
+/**
+ * Fetch with a timeout and keepalives sent to the client while waiting.
+ * Aborts if the request takes longer than FETCH_TIMEOUT_MS.
+ * @param {string} url
+ * @param {object} options - fetch options
+ * @param {Function|null} on_waiting - called every ~2s while fetch is in-flight
+ * @returns {Promise<Response>}
+ * @throws {Error} with name 'AbortError' on timeout
+ */
+async function timed_fetch(url, options, on_waiting = null) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let keepalive_iv = null;
+  if (on_waiting) {
+    keepalive_iv = setInterval(on_waiting, 2000);
+  }
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+    if (keepalive_iv) clearInterval(keepalive_iv);
   }
 }
 
@@ -176,7 +201,27 @@ export async function chat_completion({
 
   let data;
   while (true) {
-    const response = await fetch(url, fetch_options);
+    let response;
+
+    try {
+      response = await timed_fetch(url, fetch_options, on_waiting);
+    } catch (err) {
+      // Timeout or network error — retryable
+      if (retry.total_attempts < MAX_RETRIES) {
+        retry.total_attempts++;
+        const reason = err.name === 'AbortError' ? 'timeout' : err.message;
+        const delay_ms = calculate_retry_delay(retry.total_attempts, null);
+
+        console.log(
+          `  OpenRouter ${reason} — retrying in ${Math.round(delay_ms / 1000)}s (attempt #${retry.total_attempts}/${MAX_RETRIES})`
+        );
+        debug_log(`openrouter: ${reason}, retry #${retry.total_attempts}/${MAX_RETRIES}`);
+
+        await sleep_with_keepalive(delay_ms, on_waiting);
+        continue;
+      }
+      throw err;
+    }
 
     // HTTP-level retryable errors (429, 502, 503)
     if (!response.ok) {
@@ -300,7 +345,21 @@ export async function chat_completion_stream({
   let response;
 
   while (true) {
-    response = await fetch(stream_url, stream_fetch_options);
+    try {
+      response = await timed_fetch(stream_url, stream_fetch_options, on_waiting);
+    } catch (err) {
+      if (retry.total_attempts < MAX_RETRIES) {
+        retry.total_attempts++;
+        const reason = err.name === 'AbortError' ? 'timeout' : err.message;
+        const delay_ms = calculate_retry_delay(retry.total_attempts, null);
+        console.log(
+          `  OpenRouter ${reason} — retrying in ${Math.round(delay_ms / 1000)}s (attempt #${retry.total_attempts}/${MAX_RETRIES})`
+        );
+        await sleep_with_keepalive(delay_ms, on_waiting);
+        continue;
+      }
+      throw err;
+    }
 
     if (!response.ok) {
       const is_retryable = response.status === 429 || response.status === 502 || response.status === 503;
